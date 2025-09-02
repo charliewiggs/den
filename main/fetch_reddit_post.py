@@ -12,6 +12,52 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=ENV_PATH)  # loads .env into os.environ
 
+def _print_auth_debug():
+    # Mask sensitive bits but show what's being used
+    def mask(s, keep=4):
+        if not s:
+            return "<missing>"
+        return s[:keep] + "…" if len(s) > keep else "…"
+    print("[auth-debug] client_id:", mask(os.getenv("REDDIT_CLIENT_ID")))
+    print("[auth-debug] user_agent:", os.getenv("REDDIT_USER_AGENT"))
+    print("[auth-debug] username :", os.getenv("REDDIT_USERNAME"))
+    print("[auth-debug] has password?", bool(os.getenv("REDDIT_PASSWORD")))
+
+def debug_token_request():
+    """
+    Direct POST to Reddit OAuth with password grant.
+    Prints safe fingerprints (lengths & masked) to catch stray whitespace/typos.
+    """
+    import requests, requests.auth
+
+    def mask(s, keep=4):
+        if s is None: return "<None>"
+        s = s.replace("\n","\\n").replace("\r","\\r")
+        return (s[:keep] + "…") if len(s) > keep else s
+
+    cid = (os.environ.get("REDDIT_CLIENT_ID") or "").strip()
+    sec = (os.environ.get("REDDIT_CLIENT_SECRET") or "").strip()
+    ua  = (os.environ.get("REDDIT_USER_AGENT") or "den_social/0.1").strip()
+    usr = (os.environ.get("REDDIT_USERNAME") or "").strip()
+    pwd = (os.environ.get("REDDIT_PASSWORD") or "").strip()
+
+    print("[token-debug] cid len:", len(cid), "cid:", mask(cid))
+    print("[token-debug] sec len:", len(sec), "sec:", mask(sec))
+    print("[token-debug] ua     :", ua)
+    print("[token-debug] user   :", usr)
+    print("[token-debug] pwd len:", len(pwd))
+
+    r = requests.post(
+        "https://www.reddit.com/api/v1/access_token",
+        auth=requests.auth.HTTPBasicAuth(cid, sec),
+        data={"grant_type": "password", "username": usr, "password": pwd, "scope": "identity"},
+        headers={"User-Agent": ua},
+        timeout=20,
+    )
+    print("[token-debug] status:", r.status_code)
+    print("[token-debug] body  :", r.text)
+
+
 # ------------ Configuration ------------
 SUBREDDITS = [
     "SDSU", "SanDiego", "CollegeBasketball", "CFB", "MountainWest"
@@ -22,55 +68,54 @@ LIMIT_PER_SUB = 300       # adjust if you hit rate limits
 OUT_CSV = "out/posts.csv"
 
 # ------------ Auth (read from env) ------------
-# ------------ Auth (read from env) ------------
 def load_reddit():
     """
-    Prefer script/password grant when username/password are provided (works for Script apps).
-    Otherwise, fall back to client credentials (read-only) for supported app types.
-    Requires: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT.
+    Auth with OAuth2 password grant (requires a 'personal use script' app).
+    Enforces Reddit's User-Agent policy and fails fast on misconfig.
+
+    Required env:
+      REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET,
+      REDDIT_USER_AGENT, REDDIT_USERNAME, REDDIT_PASSWORD
     """
-    import prawcore
-    required = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"]
-    missing = [k for k in required if not os.getenv(k)]
+    import praw, prawcore, os
+
+    needed = [
+        "REDDIT_CLIENT_ID",
+        "REDDIT_CLIENT_SECRET",
+        "REDDIT_USER_AGENT",
+        "REDDIT_USERNAME",
+        "REDDIT_PASSWORD",
+    ]
+    missing = [k for k in needed if not os.getenv(k)]
     if missing:
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
+
+    ua = os.environ["REDDIT_USER_AGENT"]
+    if "(by /u/" not in ua:
         raise RuntimeError(
-            "Missing env vars: " + ", ".join(missing) +
-            "\nSet them before running."
+            "REDDIT_USER_AGENT must follow Reddit's format, e.g. "
+            "'macos:den_social.sdsu_scraper:1.0.0 (by /u/FlashyFudge5434)'"
         )
 
-    common_kwargs = dict(
+    reddit = praw.Reddit(
         client_id=os.environ["REDDIT_CLIENT_ID"],
         client_secret=os.environ["REDDIT_CLIENT_SECRET"],
-        user_agent=os.environ["REDDIT_USER_AGENT"],
+        user_agent=ua,
+        username=os.environ["REDDIT_USERNAME"],
+        password=os.environ["REDDIT_PASSWORD"],
         ratelimit_seconds=10,
     )
 
-    username = os.getenv("REDDIT_USERNAME")
-    password = os.getenv("REDDIT_PASSWORD")
-
-    # Script/password grant (DO NOT set read_only here)
-    if username and password:
-        reddit = praw.Reddit(
-            username=username,
-            password=password,
-            **common_kwargs,
-        )
-        # leave reddit.read_only as-is (script authorizer)
-        return reddit
-
-    # Fallback: client-credentials (read-only)
+    # Touch an auth-required endpoint to fail fast if creds/app type are wrong
     try:
-        reddit = praw.Reddit(**common_kwargs)
-        reddit.read_only = True  # only here
-        # Force token fetch now (fail fast if 401)
         _ = reddit.user.me()
-        return reddit
     except prawcore.exceptions.ResponseException as e:
         raise RuntimeError(
-            "Reddit auth failed with client-credentials (likely 401). "
-            "Provide REDDIT_USERNAME and REDDIT_PASSWORD for a Script app, "
-            "or ensure your app type supports client credentials."
+            "OAuth failed (401). Ensure your app is type 'script' and creds are exact."
         ) from e
+
+    reddit.read_only = True  # we only fetch
+    return reddit
 
 # ------------ Helpers ------------
 def is_image_submission(sub) -> bool:
@@ -120,45 +165,66 @@ def ensure_outdir(path: str):
         os.makedirs(d, exist_ok=True)
 
 # ------------ Main ------------
-def latest_post_to_json(subreddit: str = "SDSU", out_json: str = "out/latest.json"):
+def latest_post_via_public_json(subreddit: str = "SDSU", out_json: str = "out/latest.json"):
     """
-    Fetch the most recent eligible post from a subreddit and write a JSON package
-    matching the existing CSV row schema. Keeps your current typing/filters.
+    Fetch the most recent post via Reddit's public JSON endpoint (no OAuth).
+    Uses a proper User-Agent (required) and outputs the same JSON schema
+    as latest_post_to_json for easy QA.
+
+    NOTE: This is read-only and rate-limited more aggressively than OAuth.
+    Keep requests minimal and include a descriptive User-Agent.
     """
     import json
+    import requests
 
-    reddit = load_reddit()
     ensure_outdir(out_json)
 
-    # Grab newest posts and return the first one that passes your classifier
-    for sub in reddit.subreddit(subreddit).new(limit=10):
-        ptype = classify_type(sub)
-        if ptype is None:
-            continue
+    ua = os.environ.get(
+        "REDDIT_USER_AGENT",
+        "macos:den_social.sdsu_scraper:1.0.0 (by /u/yourusername)"
+    )
+    headers = {"User-Agent": ua}
 
-        created_dt = datetime.fromtimestamp(sub.created_utc, tz=timezone.utc)
-        row = {
-            "id": sub.id,
-            "created_utc": int(sub.created_utc),
-            "created_iso": created_dt.isoformat(),
-            "subreddit": str(sub.subreddit),
-            "author": str(sub.author) if sub.author else "[deleted]",
-            "title": sub.title,
-            "permalink": f"https://www.reddit.com{sub.permalink}",
-            "url": sub.url,
-            "post_type": ptype,
-            "score": sub.score,
-            "num_comments": sub.num_comments,
-            "selftext": sub.selftext if ptype == "text" else "",
-        }
+    url = f"https://www.reddit.com/r/{subreddit}/new.json"
+    params = {"limit": 1, "raw_json": 1}  # raw_json=1 avoids HTML entity escaping
+    resp = requests.get(url, headers=headers, params=params, timeout=20)
+    resp.raise_for_status()  # fail fast with a clean traceback if blocked or throttled
 
-        with open(out_json, "w", encoding="utf-8") as f:
-            json.dump(row, f, ensure_ascii=False, indent=2)
-
-        print(f"Wrote latest post from r/{subreddit} to {out_json}")
+    data = resp.json()
+    if not data.get("data", {}).get("children"):
+        print(f"No posts found in r/{subreddit}")
         return
 
-    print(f"No eligible posts found in r/{subreddit}")
+    d = data["data"]["children"][0]["data"]
+
+    # Match your existing schema
+    if d.get("is_self"):
+        ptype = "text"
+    elif str(d.get("post_hint")) == "image":
+        ptype = "image"
+    else:
+        ptype = "link"
+
+    created_dt = datetime.fromtimestamp(d["created_utc"], tz=timezone.utc)
+    row = {
+        "id": d["id"],
+        "created_utc": int(d["created_utc"]),
+        "created_iso": created_dt.isoformat(),
+        "subreddit": d.get("subreddit", subreddit),
+        "author": d.get("author") or "[deleted]",
+        "title": d.get("title", ""),
+        "permalink": f"https://www.reddit.com{d.get('permalink','')}",
+        "url": d.get("url"),
+        "post_type": ptype,
+        "score": d.get("score", 0),
+        "num_comments": d.get("num_comments", 0),
+        "selftext": d.get("selftext", "") if ptype == "text" else "",
+    }
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(row, f, ensure_ascii=False, indent=2)
+
+    print(f"[public] Wrote latest post from r/{subreddit} to {out_json}")
 
 def main():
     reddit = load_reddit()
