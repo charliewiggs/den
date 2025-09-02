@@ -1,130 +1,207 @@
+# den_social/main/fetch_reddit_post.py
 import os
-import json
-import time
-from pathlib import Path
 from datetime import datetime, timezone
+from typing import Dict, Any, List
 
 import requests
+import pymysql
 
-# ---- Helpers ---------------------------------------------------------------
+# --------- Config (import your simple knobs) ----------
+try:
+    from den_social.main.reddit_config import SUBREDDITS, POST_LIMIT
+except Exception:
+    SUBREDDITS = ["SDSU"]
+    POST_LIMIT = 25
 
-def ensure_outdir(path: str):
-    d = Path(path).parent
-    d.mkdir(parents=True, exist_ok=True)
+# --------- Helpers ----------
+def _ua() -> str:
+    """Reddit requires a descriptive User-Agent."""
+    return os.environ.get(
+        "REDDIT_USER_AGENT",
+        "macos:den_social.scraper:1.0.0 (by /u/yourusername)"
+    )
 
-def _row_from_listing_item(d: dict) -> dict:
-    """Map reddit listing item -> our compact row schema."""
+def _extract_images_from_gallery(d: Dict[str, Any]) -> List[str]:
+    """Collect image URLs for gallery posts."""
+    images: List[str] = []
+    gallery = d.get("gallery_data") or {}
+    media = d.get("media_metadata") or {}
+    for it in gallery.get("items", []) or []:
+        mid = it.get("media_id")
+        if not mid:
+            continue
+        meta = media.get(mid) or {}
+        src = (meta.get("s") or {}).get("u")
+        if not src:
+            previews = meta.get("p") or []
+            if previews:
+                src = previews[-1].get("u")
+        if src:
+            images.append(src.replace("&amp;", "&"))
+    return images
+
+def _guess_post_type(d: Dict[str, Any]) -> str:
+    """Return one of: 'text' | 'image' | 'link'."""
     if d.get("is_self"):
-        ptype = "text"
-    elif str(d.get("post_hint")) == "image":
-        ptype = "image"
+        return "text"
+    if d.get("is_gallery"):
+        return "image"
+    if str(d.get("post_hint")) == "image":
+        return "image"
+    return "link"
+
+def _serialize_listing_post(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one listing child into a DB-friendly dict."""
+    post_type = _guess_post_type(d)
+    images: List[str] = []
+    if d.get("is_gallery"):
+        images = _extract_images_from_gallery(d)
+        post_type = "image"
+    elif str(d.get("post_hint")) == "image" and d.get("url"):
+        images = [d["url"]]
+        post_type = "image"
     else:
-        ptype = "link"
+        url = (d.get("url") or "").lower()
+        if url.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            images = [d.get("url")]
+            post_type = "image"
 
     created_dt = datetime.fromtimestamp(d["created_utc"], tz=timezone.utc)
     return {
         "id": d["id"],
         "created_utc": int(d["created_utc"]),
         "created_iso": created_dt.isoformat(),
-        "subreddit": d.get("subreddit", ""),
+        "subreddit": d.get("subreddit"),
         "author": d.get("author") or "[deleted]",
-        "title": d.get("title", ""),
+        "title": d.get("title") or "",
         "permalink": f"https://www.reddit.com{d.get('permalink','')}",
         "url": d.get("url"),
-        "post_type": ptype,
+        "post_type": post_type,
         "score": d.get("score", 0),
         "num_comments": d.get("num_comments", 0),
-        "selftext": d.get("selftext", "") if ptype == "text" else "",
+        "selftext": d.get("selftext", "") if post_type == "text" else "",
+        "images": images,
     }
 
-def _fetch_new_public(subreddit: str, limit: int, ua: str) -> list[dict]:
-    """Fetch up to `limit` newest posts via public JSON, with pagination."""
-    url = f"https://www.reddit.com/r/{subreddit}/new.json"
-    headers = {"User-Agent": ua}
-    out, after = [], None
+# --------- DB helpers (lean, no SSL) ----------
+def _db_params():
+    """Read connection settings from env with safe defaults."""
+    return {
+        "host": os.getenv("DB_HOST", "localhost"),
+        "user": os.getenv("DB_USER", "admin"),
+        "password": os.getenv("DB_PASS", ""),
+        "database": os.getenv("DB_NAME", "densocial"),
+        "port": int(os.getenv("DB_PORT", "3306")),
+        "charset": "utf8mb4",
+        "autocommit": True,
+        "cursorclass": pymysql.cursors.Cursor,
+    }
 
-    while len(out) < limit:
-        remaining = limit - len(out)
-        params = {
-            "limit": min(100, remaining),
-            "raw_json": 1,
-        }
-        if after:
-            params["after"] = after
+def _db_conn():
+    return pymysql.connect(**_db_params())
 
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        children = j.get("data", {}).get("children", [])
-        if not children:
-            break
-
-        for c in children:
-            out.append(_row_from_listing_item(c["data"]))
-            if len(out) >= limit:
-                break
-
-        after = j.get("data", {}).get("after")
-        if not after:
-            break
-
-        # Be polite to public endpoints.
-        time.sleep(0.5)
-
-    # Sort newest -> oldest to be clearly chronological in output
-    out.sort(key=lambda x: x["created_utc"], reverse=True)
-    return out
-
-# ---- Public API ------------------------------------------------------------
-
-def fetch_posts_from_config():
+def _db_upsert_posts(rows: List[Dict[str, Any]]) -> int:
     """
-    Read subreddits + count from reddit_config and write a single JSON array
-    to OUT_JSON with posts from all subreddits (newest -> oldest within each).
+    Upsert normalized rows into reddit_posts.
+    posted='no' on first insert; not overwritten on updates.
     """
-    from den_social.main.reddit_config import (
-        SUBREDDITS,
-        POSTS_PER_SUBREDDIT,
-        OUT_JSON,
-    )
-
-    ua = os.environ.get(
-        "REDDIT_USER_AGENT",
-        "macos:den_social.sdsu_scraper:1.0.0 (by /u/yourusername)",
-    )
-
-    all_rows = []
-    for sr in SUBREDDITS:
-        rows = _fetch_new_public(sr, POSTS_PER_SUBREDDIT, ua)
-        all_rows.extend(rows)
-
-    # Optionally sort across subs too (keep output globally chronological)
-    all_rows.sort(key=lambda x: x["created_utc"], reverse=True)
-
-    ensure_outdir(OUT_JSON)
-    with open(OUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(all_rows, f, ensure_ascii=False, indent=2)
-
-    print(f"[public] Wrote {len(all_rows)} posts to {OUT_JSON}")
-
-def latest_post_via_public_json(subreddit: str = "SDSU", out_json: str = "out/latest.json"):
-    """Quick QA helper: write only the latest post from one subreddit."""
-    ua = os.environ.get(
-        "REDDIT_USER_AGENT",
-        "macos:den_social.sdsu_scraper:1.0.0 (by /u/yourusername)",
-    )
-    rows = _fetch_new_public(subreddit, 1, ua)
     if not rows:
-        print(f"No posts found in r/{subreddit}")
-        return
+        return 0
 
-    ensure_outdir(out_json)
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(rows[0], f, ensure_ascii=False, indent=2)
-    print(f"[public] Wrote latest post from r/{subreddit} to {out_json}")
+    insert_sql = """
+    INSERT INTO reddit_posts (
+      reddit_id, subreddit, author, title, selftext, url, permalink, post_type,
+      score, num_comments, created_utc, created_at,
+      image_1_url, image_2_url, image_3_url, image_4_url, image_5_url,
+      posted
+    ) VALUES (
+      %(reddit_id)s, %(subreddit)s, %(author)s, %(title)s, %(selftext)s, %(url)s, %(permalink)s, %(post_type)s,
+      %(score)s, %(num_comments)s, %(created_utc)s, %(created_at)s,
+      %(image_1_url)s, %(image_2_url)s, %(image_3_url)s, %(image_4_url)s, %(image_5_url)s,
+      'no'
+    )
+    ON DUPLICATE KEY UPDATE
+      subreddit=VALUES(subreddit),
+      author=VALUES(author),
+      title=VALUES(title),
+      selftext=VALUES(selftext),
+      url=VALUES(url),
+      permalink=VALUES(permalink),
+      post_type=VALUES(post_type),
+      score=VALUES(score),
+      num_comments=VALUES(num_comments),
+      created_utc=VALUES(created_utc),
+      created_at=VALUES(created_at),
+      image_1_url=VALUES(image_1_url),
+      image_2_url=VALUES(image_2_url),
+      image_3_url=VALUES(image_3_url),
+      image_4_url=VALUES(image_4_url),
+      image_5_url=VALUES(image_5_url);
+    """
 
-# ---- CLI ------------------------------------------------------------------
+    def _prep(row: Dict[str, Any]) -> Dict[str, Any]:
+        imgs = row.get("images") or []
+        return {
+            "reddit_id": row["id"],
+            "subreddit": row.get("subreddit"),
+            "author": row.get("author"),
+            "title": row.get("title"),
+            "selftext": row.get("selftext") or None,
+            "url": row.get("url"),
+            "permalink": row.get("permalink"),
+            "post_type": row.get("post_type"),
+            "score": int(row.get("score", 0)),
+            "num_comments": int(row.get("num_comments", 0)),
+            "created_utc": int(row["created_utc"]),
+            "created_at": datetime.utcfromtimestamp(int(row["created_utc"])).strftime("%Y-%m-%d %H:%M:%S"),
+            "image_1_url": imgs[0] if len(imgs) > 0 else None,
+            "image_2_url": imgs[1] if len(imgs) > 1 else None,
+            "image_3_url": imgs[2] if len(imgs) > 2 else None,
+            "image_4_url": imgs[3] if len(imgs) > 3 else None,
+            "image_5_url": imgs[4] if len(imgs) > 4 else None,
+        }
+
+    conn = _db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(insert_sql, [_prep(r) for r in rows])
+        return len(rows)
+    finally:
+        conn.close()
+
+# --------- Fetch → upsert ----------
+def fetch_posts_via_public_json(
+    subreddits: List[str] = None,
+    limit_per_sub: int = None,
+):
+    """
+    Fetch newest posts for each subreddit and upsert directly into MySQL.
+    """
+    if subreddits is None:
+        subreddits = SUBREDDITS
+    if limit_per_sub is None:
+        limit_per_sub = POST_LIMIT
+
+    headers = {"User-Agent": _ua()}
+    all_rows: List[Dict[str, Any]] = []
+
+    for sr in subreddits:
+        resp = requests.get(
+            f"https://www.reddit.com/r/{sr}/new.json",
+            headers=headers,
+            params={"limit": limit_per_sub, "raw_json": 1},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        children = (payload.get("data") or {}).get("children") or []
+        for c in children:
+            d = c.get("data") or {}
+            all_rows.append(_serialize_listing_post(d))
+
+    all_rows.sort(key=lambda r: r["created_utc"], reverse=True)
+    upserted = _db_upsert_posts(all_rows)
+    print(f"[db] Upserted {upserted} post(s) into reddit_posts")
 
 if __name__ == "__main__":
-    # `python -m den_social.main.fetch_reddit_post`
-    fetch_posts_from_config()
+    fetch_posts_via_public_json()
