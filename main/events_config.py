@@ -1,96 +1,134 @@
 # den_social/main/events_config.py
-import os
+# Lean config for 3-model event discovery + extraction
 
-# -----------------------------
-# AREA SETTINGS
-# -----------------------------
-NEIGHBORHOOD = os.getenv("EVENTS_NEIGHBORHOOD", "Pacific Beach")
-CITY = os.getenv("EVENTS_CITY", "San Diego")
-STATE = os.getenv("EVENTS_STATE", "California")
-COUNTRY = os.getenv("EVENTS_COUNTRY", "United States")
-TIMEZONE = os.getenv("EVENTS_TIMEZONE", "America/Los_Angeles")
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-# Optional geofence (helps filter to the neighborhood)
-# Pacific Beach approx center; tweak as needed.
-CENTER_LAT = float(os.getenv("EVENTS_CENTER_LAT", "32.7976"))
-CENTER_LON = float(os.getenv("EVENTS_CENTER_LON", "-117.2526"))
-RADIUS_MILES = float(os.getenv("EVENTS_RADIUS_MILES", "5"))
+# ----------------------------- AREA / WINDOW --------------------------------
+AREA = {
+    "neighborhood": "Pacific Beach",
+    "city": "San Diego",
+    "state": "California",
+    "timezone": "America/Los_Angeles",
+}
+TIME_WINDOW_DAYS = 14  # default; can override via env in fetcher
 
-# -----------------------------
-# CRAWL / PARSE KNOBS
-# -----------------------------
-REQUEST_TIMEOUT_S = int(os.getenv("EVENTS_REQUEST_TIMEOUT_S", "20"))
-MAX_SEED_PAGES = int(os.getenv("EVENTS_MAX_SEED_PAGES", "20"))        # how many seed URLs to attempt
-MAX_FOLLOW_PER_SEED = int(os.getenv("EVENTS_MAX_FOLLOW_PER_SEED", "12"))  # detail pages to follow per seed
-MAX_EVENTS = int(os.getenv("EVENTS_MAX_EVENTS", "400"))
-FUTURE_DAYS_LIMIT = int(os.getenv("EVENTS_FUTURE_DAYS_LIMIT", "60"))  # keep events within N days ahead
+def build_date_window(tz_name: str, days_ahead: int):
+    tz = ZoneInfo(tz_name)
+    today_local = datetime.now(tz).date()
+    start_dt = datetime.combine(today_local, datetime.min.time(), tz)
+    end_dt = start_dt + timedelta(days=days_ahead)
+    return start_dt, end_dt
 
-# -----------------------------
-# OUTPUT
-# -----------------------------
-OUTPUT_TXT_PATH = os.getenv("EVENTS_OUTPUT_TXT", "events_output.txt")
-OUTPUT_RAW_JSONL_PATH = os.getenv("EVENTS_OUTPUT_JSONL", "events_raw.jsonl")
-USE_OPENAI_FORMATTING = os.getenv("EVENTS_USE_OPENAI", "1").lower() in ("1", "true", "yes")
+# ----------------------------- MODELS / BUDGETS ------------------------------
+MODEL_DISCOVERY = "gpt-4o-mini"       # Model 1 & 2 (URL discovery)
+MODEL_EXTRACTION = "gpt-4o-mini"      # Model 3 (event extraction)
 
-# -----------------------------
-# SEED PAGES (edit freely)
-# Add neighborhood calendars and venues you care about.
-# -----------------------------
-SOURCE_PAGES = [
-    "https://www.sandiegoreader.com/events/pacific-beach/",
-    "https://www.pacificbeach.org/events/",
-    "https://www.eventbrite.com/d/ca--san-diego/pacific-beach--events/",
-    "https://www.meetup.com/find/?source=EVENTS&keywords=Pacific%20Beach&location=us--CA--San+Diego",
-    "https://www.belmontpark.com/events/",
-    "https://www.pbshoreclub.com/events",
-]
+MAX_DISCOVERY_TOKENS = 1000
+MAX_EXTRACTION_TOKENS = 1800
 
-# -----------------------------
-# OPENAI (formatting/cleanup only)
-# Matches your import/use pattern exactly.
-# -----------------------------
-OPENAI_MODEL = os.getenv("EVENTS_OPENAI_MODEL", "gpt-4o-mini")
-MAX_TOTAL_TOKENS = int(os.getenv("EVENTS_MAX_TOTAL_TOKENS", "120000"))
-DESIRED_OUTPUT_TOKENS = int(os.getenv("EVENTS_DESIRED_OUTPUT_TOKENS", "1500"))
+SITES_PER_MODEL = 10                  # Model 1 returns 10, Model 2 returns 10 new
+SITES_PER_GROUP = 3                   # Extractor processes 3 pages at a time
+MAX_SOURCE_TEXT_CHARS = 60000         # Truncate page text passed to extractor
 
-# Prompt passed to OpenAI to clean/normalize/dedupe the scraped events
-# Use .format(...) on the 'user' block to inject the area + the raw JSON.
-events_prompt = [
-    {
-        "role": "system",
-        "content": (
-            "You are a precise local events curator. Given a JSON array of raw events scraped "
-            "from the web, deduplicate near-duplicates, normalize dates/times to the area's "
-            "timezone, correct obvious parse issues, and output a clean human-readable text list. "
-            "Only keep events that are likely in or near the target area and within the next N days. "
-            "Do not hallucinate missing details; leave fields blank if not present."
-        ),
-    },
-    {
-        "role": "user",
-        "content": (
-            "Target Area:\n"
-            "Neighborhood: {neighborhood}\n"
-            "City: {city}\n"
-            "State: {state}\n"
-            "Timezone: {timezone}\n"
-            "Future window: next {future_days} days\n\n"
-            "Requirements:\n"
-            "1) Deduplicate events with same title and date/time (±90 minutes).\n"
-            "2) Normalize formats:\n"
-            "   - Date: Mon, Sep 9, 2025\n"
-            "   - Time: 7:30 PM (12‑hour, omit if unknown)\n"
-            "   - Price: 'Free' or '$<amount>' if parsable\n"
-            "3) Output format per event (one blank line between events):\n"
-            "   Title\n"
-            "   Date — Time\n"
-            "   Venue · Address\n"
-            "   Price: <value>\n"
-            "   URL: <url>\n"
-            "   Source: <domain>\n"
-            "4) Sort by start date/time ascending.\n"
-            "5) Exclude ads, tours to other cities, and non-events.\n"
-            "\nRAW_EVENTS_JSON:\n{raw_json}"
-        ),
-    },
-]
+# ----------------------------- PROMPTS ---------------------------------------
+# Model 1: find 10 event websites in the area
+MODEL1_SYSTEM = (
+    "You are a meticulous local event scout. "
+    "Return ONLY a JSON array of URLs to websites that list public, time-bound events "
+    "for the specified neighborhood/city/state. Include major aggregators (Eventbrite, Meetup) "
+    "AND hyper-local venues: bars, restaurants, community centers, parks, clubs, theaters, "
+    "neighborhood associations, libraries, schools, surf/beach orgs, etc. "
+    "Exclude social profiles with no event listings. No duplicates. JSON array only."
+)
+MODEL1_USER_TEMPLATE = """Area:
+Neighborhood: {neighborhood}
+City: {city}
+State: {state}
+Timezone: {timezone}
+Days ahead: {days_ahead}
+
+Return exactly {sites_per_model} URLs as a JSON array. Favor pages likely to have upcoming events for this area.
+"""
+def build_model1_user_prompt(area: dict, days_ahead: int) -> str:
+    return MODEL1_USER_TEMPLATE.format(
+        neighborhood=area["neighborhood"],
+        city=area["city"],
+        state=area["state"],
+        timezone=area["timezone"],
+        days_ahead=days_ahead,
+        sites_per_model=SITES_PER_MODEL,
+    )
+
+# Model 2: find 10 NEW websites (no overlap with Model 1)
+MODEL2_SYSTEM = (
+    "You are a diligent second-pass scout. Given an existing list of websites, "
+    "return ONLY a JSON array of NEW URLs (no overlap) that list public, time-bound events "
+    "in the same area. Include hyper-local venues and orgs. JSON array only."
+)
+MODEL2_USER_TEMPLATE = """Area:
+Neighborhood: {neighborhood}
+City: {city}
+State: {state}
+Timezone: {timezone}
+Days ahead: {days_ahead}
+
+Existing URLs (do NOT include these again):
+{existing_urls_json}
+
+Return exactly {sites_per_model} NEW URLs as a JSON array. Avoid duplicates and off-topic pages.
+"""
+def build_model2_user_prompt(area: dict, days_ahead: int, existing_urls: list[str]) -> str:
+    import json as _json
+    return MODEL2_USER_TEMPLATE.format(
+        neighborhood=area["neighborhood"],
+        city=area["city"],
+        state=area["state"],
+        timezone=area["timezone"],
+        days_ahead=days_ahead,
+        existing_urls_json=_json.dumps(existing_urls or [], ensure_ascii=False, indent=2),
+        sites_per_model=SITES_PER_MODEL,
+    )
+
+# Model 3: extract events from up to 3 pages at a time
+MODEL3_SYSTEM = (
+    "You extract structured events from raw webpage text. "
+    "Only include events INSIDE the specified neighborhood, within the date window. "
+    "If uncertain about neighborhood inclusion, omit. Return ONLY a JSON array of events."
+)
+MODEL3_USER_TEMPLATE = """Extract events strictly inside:
+Neighborhood: {neighborhood}
+City: {city}
+State: {state}
+Timezone: {timezone}
+Date window: {start_iso} to {end_iso}
+
+Schema (array of objects):
+{{
+  "name": "string",
+  "start_local_iso": "YYYY-MM-DDTHH:MM",
+  "end_local_iso": "YYYY-MM-DDTHH:MM or null",
+  "venue_name": "string or null",
+  "address": "string or null",
+  "neighborhood": "{neighborhood}",
+  "city": "{city}",
+  "state": "{state}",
+  "category": "string",
+  "price": "string or null",
+  "description": "1–3 sentences",
+  "source_name": "string",
+  "source_url": "https://...",
+  "tags": ["optional", "keywords"]
+}}
+
+Below are up to 3 pages. If a page has no relevant events in the window, ignore it.
+
+{pages_block}
+
+Return a JSON array only.
+"""
+def build_pages_block(pages: list[dict]) -> str:
+    lines = []
+    for idx, p in enumerate(pages, start=1):
+        lines.append(f"### PAGE {idx}\nURL: {p['url']}\nTEXT (truncated):\n---\n{p['text']}\n---")
+    return "\n\n".join(lines)
